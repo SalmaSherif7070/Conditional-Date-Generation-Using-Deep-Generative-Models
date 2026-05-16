@@ -1,12 +1,12 @@
 """
-Model 3 evaluation — mirrors src/evaluate.py for Models 1 & 2.
-Runs constrained sampling on the validation set and reports
+Model 4 evaluation — mirrors src/model_3/evaluate.py.
+Runs constrained Langevin sampling on the validation set and reports
 per-condition accuracy with a printed sample table.
 """
 import torch
 from torch.utils.data import DataLoader
 
-from src.model_3.model import is_leap, days_in_month, day_of_week
+from src.model_4.model import is_leap, days_in_month, day_of_week
 from src.data_processing import REV_DOW, REV_MON
 
 
@@ -46,12 +46,12 @@ def check_conditions(dates: torch.Tensor, conditions: torch.Tensor) -> dict:
 
 def evaluate_model(model, val_ds, device: str, n_show: int = 15) -> dict:
     """
-    Run constrained sampling on the full validation set.
+    Run constrained Langevin sampling on the full validation set.
     Prints aggregate metrics and a per-sample table (first n_show rows).
 
     Parameters
     ----------
-    model  : DateCVAE (or any object with a .sample(X, device=) method)
+    model  : DateEBM (any object with a .sample(X, device=) method)
     val_ds : validation dataset (yields (X, Y) pairs)
     device : "cpu" or "cuda"
     n_show : number of sample rows to print
@@ -60,14 +60,14 @@ def evaluate_model(model, val_ds, device: str, n_show: int = 15) -> dict:
     -------
     dict with keys: csr, dow_acc, mon_acc, leap_acc, decade_acc
     """
-    loader = DataLoader(val_ds, batch_size=512, shuffle=False)
+    loader = DataLoader(val_ds, batch_size=128, shuffle=False)
 
     all_X, all_Y_gen = [], []
     model.eval()
     with torch.no_grad():
         for X_b, _ in loader:
-            X_b   = X_b.to(device)
-            Y_b   = model.sample(X_b, n_samples=1, device=device).cpu()
+            X_b  = X_b.to(device)
+            Y_b  = model.sample(X_b, n_samples=1, device=device).cpu()
             all_X.append(X_b.cpu())
             all_Y_gen.append(Y_b)
 
@@ -75,7 +75,7 @@ def evaluate_model(model, val_ds, device: str, n_show: int = 15) -> dict:
     Y_gen_all = torch.cat(all_Y_gen)
     metrics   = check_conditions(Y_gen_all, X_all)
 
-    print("\n── Model 3 Evaluation (Interval-Based, any valid date is correct) ──")
+    print("\n── Model 4 Evaluation (Interval-Based, any valid date is correct) ──")
     print(f"  CSR – all conditions satisfied : {metrics['csr']:.3f}")
     print(f"  Day-of-week accuracy           : {metrics['dow_acc']:.3f}")
     print(f"  Month accuracy                 : {metrics['mon_acc']:.3f}")

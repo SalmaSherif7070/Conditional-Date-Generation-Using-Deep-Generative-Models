@@ -1,7 +1,7 @@
 """
-Model 3 visualisation — mirrors visualization patterns from Models 1 & 2.
-Produces CVAE-specific plots (ELBO loss, reconstruction vs KL, β schedule,
-CSR curve, per-condition accuracy bar chart, combined overview).
+Model 4 visualisation — mirrors src/model_3/visualization.py.
+Produces EBM-specific plots (CD loss, energy gap, CSR curve,
+per-condition accuracy bar chart, combined overview).
 """
 import os
 import matplotlib.pyplot as plt
@@ -16,10 +16,10 @@ STYLE = {
 COLORS = {
     "train":  "#4C72B0",
     "val":    "#DD8452",
-    "recon":  "#55A868",
-    "kl":     "#C44E52",
-    "csr":    "#8172B2",
-    "beta":   "#CCB974",
+    "e_pos":  "#C44E52",
+    "e_neg":  "#55A868",
+    "gap":    "#8172B2",
+    "csr":    "#CCB974",
 }
 
 
@@ -30,78 +30,85 @@ def _save(fig, path: str):
     print(f"Saved: {path}")
 
 
-# ── ELBO loss curves ──────────────────────────────────────────────────────────
+# ── CD loss curves ────────────────────────────────────────────────────────────
 
 def plot_loss_curves(history: dict, save_dir: str):
-    """Train / Val ELBO loss over epochs."""
+    """Train / Val Contrastive Divergence loss over epochs."""
     with plt.rc_context(STYLE):
         fig, ax = plt.subplots(figsize=(9, 5))
         ax.plot(history["epochs"], history["train_loss"], lw=2,
-                color=COLORS["train"], label="Train ELBO Loss")
+                color=COLORS["train"], label="Train CD Loss")
         ax.plot(history["epochs"], history["val_loss"],   lw=2,
-                color=COLORS["val"],   label="Val ELBO Loss", ls="--")
+                color=COLORS["val"],   label="Val CD Loss", ls="--")
         ax.set_xlabel("Epoch", fontsize=12)
-        ax.set_ylabel("ELBO Loss", fontsize=12)
-        ax.set_title("Model 3 – ELBO Loss (Train vs Val)", fontsize=14)
+        ax.set_ylabel("Contrastive Divergence Loss", fontsize=12)
+        ax.set_title("Model 4 – CD Loss (Train vs Val)", fontsize=14)
         ax.legend(fontsize=11)
         ax.grid(alpha=0.3)
-        _save(fig, os.path.join(save_dir, "model3_loss_curves.png"))
+        _save(fig, os.path.join(save_dir, "model4_loss_curves.png"))
 
 
 def plot_loss_log_scale(history: dict, save_dir: str):
-    """Train / Val ELBO loss on a log scale."""
+    """Train / Val CD loss on a log scale (absolute values)."""
     with plt.rc_context(STYLE):
         fig, ax = plt.subplots(figsize=(9, 5))
-        ax.semilogy(history["epochs"], history["train_loss"], lw=2,
-                    color=COLORS["train"], label="Train ELBO Loss")
-        ax.semilogy(history["epochs"], history["val_loss"],   lw=2,
-                    color=COLORS["val"],   label="Val ELBO Loss", ls="--")
+        # CD loss can be negative — plot |loss| on log scale
+        train_abs = [abs(v) for v in history["train_loss"]]
+        val_abs   = [abs(v) for v in history["val_loss"]]
+        ax.semilogy(history["epochs"], train_abs, lw=2,
+                    color=COLORS["train"], label="|Train CD Loss|")
+        ax.semilogy(history["epochs"], val_abs,   lw=2,
+                    color=COLORS["val"],   label="|Val CD Loss|", ls="--")
         ax.set_xlabel("Epoch", fontsize=12)
-        ax.set_ylabel("ELBO Loss (log scale)", fontsize=12)
-        ax.set_title("Model 3 – Loss Log Scale", fontsize=14)
+        ax.set_ylabel("|CD Loss| (log scale)", fontsize=12)
+        ax.set_title("Model 4 – Loss Log Scale", fontsize=14)
         ax.legend(fontsize=11)
         ax.grid(alpha=0.3, which="both")
-        _save(fig, os.path.join(save_dir, "model3_loss_log.png"))
+        _save(fig, os.path.join(save_dir, "model4_loss_log.png"))
 
 
-# ── CVAE-specific plots ───────────────────────────────────────────────────────
+# ── EBM-specific plots ────────────────────────────────────────────────────────
 
-def plot_recon_kl_split(history: dict, save_dir: str):
-    """Reconstruction loss vs KL divergence over training."""
+def plot_energy_curves(history: dict, save_dir: str):
+    """
+    E(x⁺) and E(x⁻) over training.
+    A well-trained EBM should have E(x⁺) < E(x⁻).
+    """
     with plt.rc_context(STYLE):
         fig, ax = plt.subplots(figsize=(9, 5))
-        ax.plot(history["epochs"], history["recon_loss"], lw=2,
-                color=COLORS["recon"], label="Reconstruction Loss")
-        ax2 = ax.twinx()
-        ax2.plot(history["epochs"], history["kl_loss"], lw=2,
-                 color=COLORS["kl"], ls="--", label="KL Divergence")
+        ax.plot(history["epochs"], history["e_pos"], lw=2,
+                color=COLORS["e_pos"], label="E(real)  E⁺")
+        ax.plot(history["epochs"], history["e_neg"], lw=2,
+                color=COLORS["e_neg"], label="E(MCMC)  E⁻", ls="--")
         ax.set_xlabel("Epoch", fontsize=12)
-        ax.set_ylabel("Reconstruction Loss", fontsize=12, color=COLORS["recon"])
-        ax2.set_ylabel("KL Divergence",       fontsize=12, color=COLORS["kl"])
-        ax.set_title("Model 3 – Reconstruction vs KL", fontsize=14)
-        lines1, labels1 = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=11)
-        ax.grid(alpha=0.3)
-        _save(fig, os.path.join(save_dir, "model3_recon_kl.png"))
-
-
-def plot_beta_schedule(history: dict, save_dir: str):
-    """β annealing schedule over training epochs."""
-    with plt.rc_context(STYLE):
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.plot(history["epochs"], history["beta"], lw=2,
-                color=COLORS["beta"], label="β (KL weight)")
-        ax.set_xlabel("Epoch", fontsize=12)
-        ax.set_ylabel("β", fontsize=12)
-        ax.set_title("Model 3 – β Annealing Schedule", fontsize=14)
+        ax.set_ylabel("Mean Energy", fontsize=12)
+        ax.set_title("Model 4 – Energy of Real vs MCMC Samples", fontsize=14)
         ax.legend(fontsize=11)
         ax.grid(alpha=0.3)
-        _save(fig, os.path.join(save_dir, "model3_beta_schedule.png"))
+        _save(fig, os.path.join(save_dir, "model4_energy_curves.png"))
+
+
+def plot_energy_gap(history: dict, save_dir: str):
+    """
+    Energy gap  Δ = E⁺ − E⁻  over training.
+    Negative gap means real samples have lower energy than MCMC samples
+    (the desired behaviour).
+    """
+    gap = [ep - en for ep, en in zip(history["e_pos"], history["e_neg"])]
+    with plt.rc_context(STYLE):
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(history["epochs"], gap, lw=2, color=COLORS["gap"], label="E⁺ − E⁻")
+        ax.axhline(0.0, ls=":", lw=1, color="grey", label="Zero gap")
+        ax.set_xlabel("Epoch", fontsize=12)
+        ax.set_ylabel("Energy Gap", fontsize=12)
+        ax.set_title("Model 4 – Energy Gap (E⁺ − E⁻)", fontsize=14)
+        ax.legend(fontsize=11)
+        ax.grid(alpha=0.3)
+        _save(fig, os.path.join(save_dir, "model4_energy_gap.png"))
 
 
 def plot_csr_curve(history: dict, save_dir: str):
-    """Condition Satisfaction Rate on validation set over epochs."""
+    """Condition Satisfaction Rate on the validation set over epochs."""
     with plt.rc_context(STYLE):
         fig, ax = plt.subplots(figsize=(9, 5))
         ax.plot(history["epochs"], history["csr"], lw=2,
@@ -109,15 +116,15 @@ def plot_csr_curve(history: dict, save_dir: str):
         ax.axhline(1.0, ls=":", lw=1, color="grey", label="Perfect CSR")
         ax.set_xlabel("Epoch", fontsize=12)
         ax.set_ylabel("Condition Satisfaction Rate", fontsize=12)
-        ax.set_title("Model 3 – Validation CSR Over Training", fontsize=14)
+        ax.set_title("Model 4 – Validation CSR Over Training", fontsize=14)
         ax.set_ylim(0, 1.1)
         ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
         ax.legend(fontsize=11)
         ax.grid(alpha=0.3)
-        _save(fig, os.path.join(save_dir, "model3_csr_curve.png"))
+        _save(fig, os.path.join(save_dir, "model4_csr_curve.png"))
 
 
-# ── Per-condition accuracy (matches Models 1 & 2) ────────────────────────────
+# ── Per-condition accuracy (matches Models 1–3) ───────────────────────────────
 
 def plot_condition_breakdown(metrics: dict, save_dir: str):
     """Bar chart of per-condition accuracy — identical layout to other models."""
@@ -135,7 +142,7 @@ def plot_condition_breakdown(metrics: dict, save_dir: str):
         fig, ax = plt.subplots(figsize=(8, 5))
         bars = ax.bar(labels, values, color=colors, edgecolor="white", linewidth=0.8)
         ax.set_ylabel("Accuracy", fontsize=12)
-        ax.set_title("Model 3 – Per-Condition Accuracy", fontsize=14)
+        ax.set_title("Model 4 – Per-Condition Accuracy", fontsize=14)
         ax.set_ylim(0, 1.15)
         ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
         for bar, val in zip(bars, values):
@@ -146,22 +153,22 @@ def plot_condition_breakdown(metrics: dict, save_dir: str):
                 ha="center", va="bottom", fontsize=10,
             )
         ax.grid(axis="y", alpha=0.3)
-        _save(fig, os.path.join(save_dir, "model3_condition_breakdown.png"))
+        _save(fig, os.path.join(save_dir, "model4_condition_breakdown.png"))
 
 
 def plot_combined_overview(history: dict, metrics: dict, save_dir: str):
-    """2×2 overview: ELBO loss | CSR curve | Recon/KL | condition breakdown."""
+    """2×2 overview: CD loss | CSR curve | Energy curves | condition breakdown."""
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-        fig.suptitle("Model 3 – Training Overview (Conditional VAE)", fontsize=15)
+        fig.suptitle("Model 4 – Training Overview (Energy-Based Model)", fontsize=15)
 
-        # Top-left: ELBO loss
+        # Top-left: CD loss
         ax = axes[0, 0]
         ax.plot(history["epochs"], history["train_loss"], lw=2,
                 color=COLORS["train"], label="Train")
         ax.plot(history["epochs"], history["val_loss"],   lw=2,
                 color=COLORS["val"],   label="Val", ls="--")
-        ax.set_title("ELBO Loss")
+        ax.set_title("CD Loss")
         ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
         ax.legend(fontsize=9); ax.grid(alpha=0.3)
 
@@ -175,27 +182,23 @@ def plot_combined_overview(history: dict, metrics: dict, save_dir: str):
         ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
         ax.grid(alpha=0.3)
 
-        # Bottom-left: Recon vs KL
-        ax    = axes[1, 0]
-        ax2   = ax.twinx()
-        ax.plot(history["epochs"], history["recon_loss"], lw=2,
-                color=COLORS["recon"], label="Recon")
-        ax2.plot(history["epochs"], history["kl_loss"],   lw=2,
-                 color=COLORS["kl"], ls="--", label="KL")
-        ax.set_title("Recon vs KL")
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Recon", color=COLORS["recon"])
-        ax2.set_ylabel("KL",   color=COLORS["kl"])
-        lines1, labs1 = ax.get_legend_handles_labels()
-        lines2, labs2 = ax2.get_legend_handles_labels()
-        ax.legend(lines1 + lines2, labs1 + labs2, fontsize=9)
-        ax.grid(alpha=0.3)
+        # Bottom-left: Energy curves
+        ax = axes[1, 0]
+        ax.plot(history["epochs"], history["e_pos"], lw=2,
+                color=COLORS["e_pos"], label="E⁺ (real)")
+        ax.plot(history["epochs"], history["e_neg"], lw=2,
+                color=COLORS["e_neg"], label="E⁻ (MCMC)", ls="--")
+        ax.set_title("Energy: Real vs MCMC")
+        ax.set_xlabel("Epoch"); ax.set_ylabel("Mean Energy")
+        ax.legend(fontsize=9); ax.grid(alpha=0.3)
 
         # Bottom-right: condition breakdown bar
         ax = axes[1, 1]
         labels = ["DOW", "Month", "Leap", "Decade", "All"]
-        values = [metrics["dow_acc"], metrics["mon_acc"],
-                  metrics["leap_acc"], metrics["decade_acc"], metrics["csr"]]
+        values = [
+            metrics["dow_acc"], metrics["mon_acc"],
+            metrics["leap_acc"], metrics["decade_acc"], metrics["csr"],
+        ]
         bar_colors = ["#4C72B0", "#55A868", "#C44E52", "#8172B2", "#CCB974"]
         bars = ax.bar(labels, values, color=bar_colors, edgecolor="white")
         ax.set_title("Per-Condition Accuracy")
@@ -207,4 +210,4 @@ def plot_combined_overview(history: dict, metrics: dict, save_dir: str):
         ax.grid(axis="y", alpha=0.3)
 
         fig.tight_layout()
-        _save(fig, os.path.join(save_dir, "model3_overview.png"))
+        _save(fig, os.path.join(save_dir, "model4_overview.png"))

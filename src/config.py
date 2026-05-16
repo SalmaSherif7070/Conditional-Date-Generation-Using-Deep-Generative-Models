@@ -56,6 +56,32 @@ class Train3Config:
 
 
 @dataclass
+class Model4Config:
+    cond_dim: int = 128       # condition embedding dimension (matches Models 1–3)
+    max_decade: int = 300     # maximum decade index (matches Models 1–3)
+    hidden_dim: int = 512     # energy network hidden width
+    n_layers: int = 4         # number of residual blocks in the energy network
+
+
+@dataclass
+class Train4Config:
+    n_epochs: int = 200
+    batch_size: int = 256
+    lr: float = 1e-4
+    # Langevin / MCMC sampling hyper-parameters
+    n_mcmc_steps: int = 60        # Langevin steps per negative sample
+    mcmc_step_size: float = 0.1   # Langevin step size (α)
+    mcmc_noise: float = 0.005     # noise std added each Langevin step
+    replay_buffer_size: int = 10_000  # persistent replay buffer capacity
+    replay_prob: float = 0.95         # probability of re-using a buffer sample
+    # Regularisation
+    l2_reg: float = 1.0           # coefficient for E(x)² regulariser
+    grad_clip: float = 1.0
+    val_split: float = 0.2
+    seed: int = 42
+
+
+@dataclass
 class PathConfig:
     data_path: str = "data/raw/data.txt"
     example_input_path: str = "data/raw/example_input.txt"
@@ -82,3 +108,12 @@ class Path3Config:
     output_dir: str = "output/model_3"
     weights_path: str = "models/model_3/weights.pt"
     figures_dir: str = "output/model_3/figures"
+
+
+@dataclass
+class Path4Config:
+    data_path: str = "data/raw/data.txt"
+    example_input_path: str = "data/raw/example_input.txt"
+    output_dir: str = "output/model_4"
+    weights_path: str = "models/model_4/weights.pt"
+    figures_dir: str = "output/model_4/figures"
