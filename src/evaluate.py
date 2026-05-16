@@ -1,14 +1,22 @@
+"""
+Model 2 evaluation — mirrors src/evaluate.py for Model 1.
+Runs constrained sampling on the validation set and reports
+per-condition accuracy with a printed sample table.
+"""
 import torch
 from torch.utils.data import DataLoader
 
-from src.model_1.model import is_leap, days_in_month, day_of_week
+from src.model_2.model import is_leap, days_in_month, day_of_week
 from src.data_processing import REV_DOW, REV_MON
 
 
+# ── Per-condition checker (identical logic to Model 1) ────────────────────────
+
 def check_conditions(dates: torch.Tensor, conditions: torch.Tensor) -> dict:
     """
-    Interval-based evaluation: a date is correct if it satisfies ALL four conditions.
-    There is no single ground-truth answer; any compliant date is valid.
+    Interval-based evaluation.
+    A date is correct if it satisfies ALL four conditions.
+    Any compliant date is valid — there is no single ground-truth answer.
     """
     d, m, y = dates[:, 0], dates[:, 1], dates[:, 2]
     dow_cond, mon_cond, leap_cond, dec_cond = (
@@ -34,26 +42,43 @@ def check_conditions(dates: torch.Tensor, conditions: torch.Tensor) -> dict:
     }
 
 
-def evaluate_model(model, val_ds, device: str, n_show: int = 15) -> dict:
+# ── Full evaluation ───────────────────────────────────────────────────────────
+
+def evaluate_model(generator, encoder, val_ds, device: str, n_show: int = 15) -> dict:
     """
-    Run constrained sampling on the validation set and report per-condition accuracy.
-    Prints a sample of generated dates with pass/fail per condition.
+    Run constrained sampling on the full validation set.
+    Prints aggregate metrics and a per-sample table (first n_show rows).
+
+    Parameters
+    ----------
+    generator : DateGenerator
+    encoder   : ConditionEncoder
+    val_ds    : validation dataset (yields (X, Y) pairs)
+    device    : "cpu" or "cuda"
+    n_show    : number of sample rows to print
+
+    Returns
+    -------
+    dict with keys: csr, dow_acc, mon_acc, leap_acc, decade_acc
     """
     loader = DataLoader(val_ds, batch_size=512, shuffle=False)
 
     all_X, all_Y_gen = [], []
-    model.eval()
+    generator.eval()
+    encoder.eval()
     with torch.no_grad():
         for X_b, _ in loader:
-            Y_b = model.sample(X_b.to(device), n_samples=1, device=device).cpu()
-            all_X.append(X_b)
+            X_b    = X_b.to(device)
+            cond   = encoder(X_b)
+            Y_b    = generator.sample(cond, X_b, device=device).cpu()
+            all_X.append(X_b.cpu())
             all_Y_gen.append(Y_b)
 
     X_all     = torch.cat(all_X)
     Y_gen_all = torch.cat(all_Y_gen)
     metrics   = check_conditions(Y_gen_all, X_all)
 
-    print("\n── Evaluation (Interval-Based, any valid date is correct) ──")
+    print("\n── Model 2 Evaluation (Interval-Based, any valid date is correct) ──")
     print(f"  CSR – all conditions satisfied : {metrics['csr']:.3f}")
     print(f"  Day-of-week accuracy           : {metrics['dow_acc']:.3f}")
     print(f"  Month accuracy                 : {metrics['mon_acc']:.3f}")
@@ -61,7 +86,8 @@ def evaluate_model(model, val_ds, device: str, n_show: int = 15) -> dict:
     print(f"  Decade accuracy                : {metrics['decade_acc']:.3f}")
 
     print(f"\n── Sample Generated Outputs (first {n_show}) ──")
-    header = f"{'Condition':<38}  {'Generated':>12}  {'DOW':>4}  {'MON':>4}  {'LEAP':>5}  {'DEC':>4}  {'ALL':>4}"
+    header = (f"{'Condition':<38}  {'Generated':>12}  "
+              f"{'DOW':>4}  {'MON':>4}  {'LEAP':>5}  {'DEC':>4}  {'ALL':>4}")
     print(header)
     print("-" * len(header))
 

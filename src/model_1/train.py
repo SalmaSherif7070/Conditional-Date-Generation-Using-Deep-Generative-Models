@@ -103,7 +103,7 @@ def train(train_ds, val_ds, model_cfg, train_cfg, device: str = "cpu"):
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
 
-        if epoch % 50 == 0 or epoch == 1 or epoch == train_cfg.n_epochs:
+        if epoch % 10 == 0 or epoch == 1 or epoch == train_cfg.n_epochs:
             print(f"{epoch:>6}  {train_loss:>12.4f}  {val_loss:>10.4f}")
 
     return model, history
