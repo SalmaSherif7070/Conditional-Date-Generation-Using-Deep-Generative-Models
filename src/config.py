@@ -41,9 +41,9 @@ class Train2Config:
 class PathConfig:
     data_path: str = "data/raw/data.txt"
     example_input_path: str = "data/raw/example_input.txt"
-    output_dir: str = "output"
+    output_dir  = "output/model_2"
     weights_path: str = "models/model_1/weights.pt"
-    figures_dir: str = "output/figures"
+    figures_dir: str = "output/model_2/figures"
 
 
 @dataclass
