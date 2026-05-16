@@ -29,16 +29,6 @@ from src.visualization import plot_loss_curves, plot_condition_breakdown, plot_l
 # Model 2
 from src.model_2.model import DateGenerator, ConditionEncoder
 from src.model_2.train import train as train_model2
-from src.model_2.evaluate import evaluate_model as evaluate_model2
-from src.model_2.visualization import (
-    plot_loss_curves        as plot2_loss_curves,
-    plot_loss_log_scale     as plot2_loss_log_scale,
-    plot_gradient_penalty   as plot2_gradient_penalty,
-    plot_csr_curve          as plot2_csr_curve,
-    plot_gumbel_temperature as plot2_gumbel_temperature,
-    plot_condition_breakdown as plot2_condition_breakdown,
-    plot_combined_overview  as plot2_combined_overview,
-)
 
 
 def _device() -> str:
@@ -56,6 +46,25 @@ def _load_model1(path_cfg: PathConfig, model_cfg: ModelConfig, device: str) -> A
 
 # ── Model 2 helpers ────────────────────────────────────────────────────────────
 
+class _Model2Wrapper:
+    """
+    Thin wrapper so Model 2's generator+encoder pair fits the same
+    interface as Model 1's single model object expected by
+    src/evaluate.py and src/visualization.py.
+    """
+    def __init__(self, generator, encoder):
+        self.generator = generator
+        self.encoder   = encoder
+
+    def eval(self):
+        self.generator.eval()
+        self.encoder.eval()
+
+    def sample(self, X, n_samples=1, device="cpu"):
+        cond = self.encoder(X)
+        return self.generator.sample(cond, X, device=device)
+
+
 def _load_model2(path2_cfg: Path2Config, model2_cfg: Model2Config, device: str):
     encoder = ConditionEncoder(model2_cfg.cond_dim, model2_cfg.max_decade).to(device)
     encoder.load_state_dict(torch.load(path2_cfg.encoder_path, map_location=device))
@@ -65,7 +74,7 @@ def _load_model2(path2_cfg: Path2Config, model2_cfg: Model2Config, device: str):
     generator.load_state_dict(torch.load(path2_cfg.generator_path, map_location=device))
     generator.eval()
 
-    return generator, encoder
+    return _Model2Wrapper(generator, encoder)
 
 
 # ── Model 1 subcommands ────────────────────────────────────────────────────────
@@ -158,15 +167,20 @@ def cmd_train2(args):
     print(f"Discriminator saved → {path2_cfg.discriminator_path}")
     print(f"Encoder       saved → {path2_cfg.encoder_path}")
 
-    metrics = evaluate_model2(G, encoder, val_ds, device)
+    model2 = _Model2Wrapper(G, encoder)
+    metrics = evaluate_model1(model2, val_ds, device)
 
-    plot2_loss_curves(history,        path2_cfg.figures_dir)
-    plot2_loss_log_scale(history,     path2_cfg.figures_dir)
-    plot2_gradient_penalty(history,   path2_cfg.figures_dir)
-    plot2_csr_curve(history,          path2_cfg.figures_dir)
-    plot2_gumbel_temperature(history, path2_cfg.figures_dir)
-    plot2_condition_breakdown(metrics, path2_cfg.figures_dir)
-    plot2_combined_overview(history, metrics, path2_cfg.figures_dir)
+    # Adapt history keys so shared visualization functions work
+    # plot_loss_curves expects: train_loss, val_loss
+    vis_history = {
+        "epochs":     history["epochs"],
+        "train_loss": history["g_loss"],   # generator loss as "train"
+        "val_loss":   history["d_loss"],   # discriminator loss as "val"
+    }
+    # Reuse shared visualization — saves into model_2 figures dir
+    plot_loss_curves(vis_history,         path2_cfg.figures_dir)
+    plot_loss_log_scale(vis_history,      path2_cfg.figures_dir)
+    plot_condition_breakdown(metrics, path2_cfg.figures_dir)
 
 
 def cmd_evaluate2(args):
@@ -177,9 +191,9 @@ def cmd_evaluate2(args):
 
     _, val_ds, _, _ = load_dataset(
         path2_cfg.data_path, train2_cfg.val_split, train2_cfg.seed)
-    G, encoder = _load_model2(path2_cfg, model2_cfg, device)
-    metrics = evaluate_model2(G, encoder, val_ds, device)
-    plot2_condition_breakdown(metrics, path2_cfg.figures_dir)
+    model2  = _load_model2(path2_cfg, model2_cfg, device)
+    metrics = evaluate_model1(model2, val_ds, device)
+    plot_condition_breakdown(metrics, path2_cfg.figures_dir)
 
 
 def cmd_predict2(args):
@@ -189,13 +203,12 @@ def cmd_predict2(args):
     input_path  = args.input  or path2_cfg.example_input_path
     output_path = args.output or os.path.join(path2_cfg.output_dir, "predictions_model2.txt")
 
-    G, encoder = _load_model2(path2_cfg, model2_cfg, device)
+    model2 = _load_model2(path2_cfg, model2_cfg, device)
 
     X, _ = load_example_input(input_path)
     X    = X.to(device)
     with torch.no_grad():
-        cond_emb = encoder(X)
-        Y_gen    = G.sample(cond_emb, X, device=device).cpu()
+        Y_gen = model2.sample(X, device=device).cpu()
 
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
