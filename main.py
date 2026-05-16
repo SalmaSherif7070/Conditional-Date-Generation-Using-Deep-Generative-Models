@@ -35,12 +35,18 @@ from src.data_processing import load_dataset, load_example_input, format_output_
 # Model 1
 from src.model_1.model import AutoregressiveDateModel
 from src.model_1.train import train as train_model1
-from src.evaluate import evaluate_model as evaluate_model1
-from src.visualization import plot_loss_curves, plot_condition_breakdown, plot_loss_log_scale
+from src.model_1.evaluate import evaluate_model as evaluate_model1
+from src.model_1.visualization import plot_loss_curves, plot_loss_log_scale, plot_condition_breakdown
 
 # Model 2
 from src.model_2.model import DateGenerator, ConditionEncoder
 from src.model_2.train import train as train_model2
+from src.model_2.evaluate import evaluate_model as evaluate_model2
+from src.model_2.visualization import (
+    plot_loss_curves as plot_loss_curves2,
+    plot_loss_log_scale as plot_loss_log_scale2,
+    plot_condition_breakdown as plot_condition_breakdown2,
+)
 
 # Model 3
 from src.model_3.model import DateCVAE
@@ -50,10 +56,6 @@ from src.model_3.visualization import (
     plot_loss_curves as plot_loss_curves3,
     plot_loss_log_scale as plot_loss_log_scale3,
     plot_condition_breakdown as plot_condition_breakdown3,
-    plot_recon_kl_split,
-    plot_beta_schedule,
-    plot_csr_curve as plot_csr_curve3,
-    plot_combined_overview as plot_combined_overview3,
 )
 
 # Model 4
@@ -64,10 +66,6 @@ from src.model_4.visualization import (
     plot_loss_curves as plot_loss_curves4,
     plot_loss_log_scale as plot_loss_log_scale4,
     plot_condition_breakdown as plot_condition_breakdown4,
-    plot_energy_curves,
-    plot_energy_gap,
-    plot_csr_curve as plot_csr_curve4,
-    plot_combined_overview as plot_combined_overview4,
 )
 
 
@@ -86,25 +84,6 @@ def _load_model1(path_cfg: PathConfig, model_cfg: ModelConfig, device: str) -> A
 
 # ── Model 2 helpers ────────────────────────────────────────────────────────────
 
-class _Model2Wrapper:
-    """
-    Thin wrapper so Model 2's generator+encoder pair fits the same
-    interface as Model 1's single model object expected by
-    src/evaluate.py and src/visualization.py.
-    """
-    def __init__(self, generator, encoder):
-        self.generator = generator
-        self.encoder   = encoder
-
-    def eval(self):
-        self.generator.eval()
-        self.encoder.eval()
-
-    def sample(self, X, n_samples=1, device="cpu"):
-        cond = self.encoder(X)
-        return self.generator.sample(cond, X, device=device)
-
-
 def _load_model2(path2_cfg: Path2Config, model2_cfg: Model2Config, device: str):
     encoder = ConditionEncoder(model2_cfg.cond_dim, model2_cfg.max_decade).to(device)
     encoder.load_state_dict(torch.load(path2_cfg.encoder_path, map_location=device))
@@ -114,7 +93,7 @@ def _load_model2(path2_cfg: Path2Config, model2_cfg: Model2Config, device: str):
     generator.load_state_dict(torch.load(path2_cfg.generator_path, map_location=device))
     generator.eval()
 
-    return _Model2Wrapper(generator, encoder)
+    return generator, encoder
 
 
 # ── Model 3 helpers ────────────────────────────────────────────────────────────
@@ -154,7 +133,7 @@ def cmd_train(args):
 
     print(f"Device : {device.upper()}")
     train_ds, val_ds, _, _ = load_dataset(path_cfg.data_path, train_cfg.val_split, train_cfg.seed)
-    print(f"Train  : {len(train_ds)} samples  |  Val/Test : {len(val_ds)} samples")
+    print(f"Train  : {len(train_ds)} samples  |  Val : {len(val_ds)} samples")
 
     model, history = train_model1(train_ds, val_ds, model_cfg, train_cfg, device)
 
@@ -227,17 +206,11 @@ def cmd_train2(args):
     print(f"Discriminator saved → {path2_cfg.discriminator_path}")
     print(f"Encoder       saved → {path2_cfg.encoder_path}")
 
-    model2 = _Model2Wrapper(G, encoder)
-    metrics = evaluate_model1(G, encoder, val_ds, device)
+    metrics = evaluate_model2(G, encoder, val_ds, device)
 
-    vis_history = {
-        "epochs":     history["epochs"],
-        "train_loss": history["g_loss"],
-        "val_loss":   history["d_loss"],
-    }
-    plot_loss_curves(vis_history,     path2_cfg.figures_dir)
-    plot_loss_log_scale(vis_history,  path2_cfg.figures_dir)
-    plot_condition_breakdown(metrics, path2_cfg.figures_dir)
+    plot_loss_curves2(history,      path2_cfg.figures_dir)
+    plot_loss_log_scale2(history,   path2_cfg.figures_dir)
+    plot_condition_breakdown2(metrics, path2_cfg.figures_dir)
 
 
 def cmd_evaluate2(args):
@@ -248,9 +221,9 @@ def cmd_evaluate2(args):
 
     _, val_ds, _, _ = load_dataset(
         path2_cfg.data_path, train2_cfg.val_split, train2_cfg.seed)
-    model2  = _load_model2(path2_cfg, model2_cfg, device)
-    metrics = evaluate_model1(model2.generator, model2.encoder, val_ds, device)
-    plot_condition_breakdown(metrics, path2_cfg.figures_dir)
+    generator, encoder = _load_model2(path2_cfg, model2_cfg, device)
+    metrics = evaluate_model2(generator, encoder, val_ds, device)
+    plot_condition_breakdown2(metrics, path2_cfg.figures_dir)
 
 
 def cmd_predict2(args):
@@ -260,12 +233,13 @@ def cmd_predict2(args):
     input_path  = args.input  or path2_cfg.example_input_path
     output_path = args.output or os.path.join(path2_cfg.output_dir, "predictions_model2.txt")
 
-    model2 = _load_model2(path2_cfg, model2_cfg, device)
+    generator, encoder = _load_model2(path2_cfg, model2_cfg, device)
 
     X, _ = load_example_input(input_path)
     X    = X.to(device)
     with torch.no_grad():
-        Y_gen = model2.sample(X, device=device).cpu()
+        cond_emb = encoder(X)
+        Y_gen    = generator.sample(cond_emb, X, device=device).cpu()
 
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -299,11 +273,7 @@ def cmd_train3(args):
 
     plot_loss_curves3(history,         path3_cfg.figures_dir)
     plot_loss_log_scale3(history,      path3_cfg.figures_dir)
-    plot_recon_kl_split(history,       path3_cfg.figures_dir)
-    plot_beta_schedule(history,        path3_cfg.figures_dir)
-    plot_csr_curve3(history,           path3_cfg.figures_dir)
     plot_condition_breakdown3(metrics, path3_cfg.figures_dir)
-    plot_combined_overview3(history, metrics, path3_cfg.figures_dir)
 
 
 def cmd_evaluate3(args):
@@ -365,11 +335,7 @@ def cmd_train4(args):
 
     plot_loss_curves4(history,         path4_cfg.figures_dir)
     plot_loss_log_scale4(history,      path4_cfg.figures_dir)
-    plot_energy_curves(history,        path4_cfg.figures_dir)
-    plot_energy_gap(history,           path4_cfg.figures_dir)
-    plot_csr_curve4(history,           path4_cfg.figures_dir)
     plot_condition_breakdown4(metrics, path4_cfg.figures_dir)
-    plot_combined_overview4(history, metrics, path4_cfg.figures_dir)
 
 
 def cmd_evaluate4(args):
@@ -423,32 +389,32 @@ if __name__ == "__main__":
     sub    = parser.add_subparsers(dest="command", required=True)
 
     # Model 1
-    sub.add_parser("train",    help="Train Model 1 (Autoregressive) on data/raw/data.txt")
-    sub.add_parser("evaluate", help="Evaluate Model 1 on the val/test split")
-    pred_p = sub.add_parser("predict", help="Run Model 1 inference on an input file")
-    pred_p.add_argument("-i", "--input",  default=None, help="Path to input conditions file")
-    pred_p.add_argument("-o", "--output", default=None, help="Path to write predictions")
+    sub.add_parser("train",    help="Train Model 1 (Autoregressive)")
+    sub.add_parser("evaluate", help="Evaluate Model 1 on the val split")
+    pred_p = sub.add_parser("predict", help="Run Model 1 inference")
+    pred_p.add_argument("-i", "--input",  default=None)
+    pred_p.add_argument("-o", "--output", default=None)
 
     # Model 2
-    sub.add_parser("train2",    help="Train Model 2 (Conditional GAN) on data/raw/data.txt")
+    sub.add_parser("train2",    help="Train Model 2 (Conditional GAN)")
     sub.add_parser("evaluate2", help="Evaluate Model 2 on the val split")
-    pred2_p = sub.add_parser("predict2", help="Run Model 2 inference on an input file")
-    pred2_p.add_argument("-i", "--input",  default=None, help="Path to input conditions file")
-    pred2_p.add_argument("-o", "--output", default=None, help="Path to write predictions")
+    pred2_p = sub.add_parser("predict2", help="Run Model 2 inference")
+    pred2_p.add_argument("-i", "--input",  default=None)
+    pred2_p.add_argument("-o", "--output", default=None)
 
     # Model 3
-    sub.add_parser("train3",    help="Train Model 3 (Conditional VAE) on data/raw/data.txt")
+    sub.add_parser("train3",    help="Train Model 3 (Conditional VAE)")
     sub.add_parser("evaluate3", help="Evaluate Model 3 on the val split")
-    pred3_p = sub.add_parser("predict3", help="Run Model 3 inference on an input file")
-    pred3_p.add_argument("-i", "--input",  default=None, help="Path to input conditions file")
-    pred3_p.add_argument("-o", "--output", default=None, help="Path to write predictions")
+    pred3_p = sub.add_parser("predict3", help="Run Model 3 inference")
+    pred3_p.add_argument("-i", "--input",  default=None)
+    pred3_p.add_argument("-o", "--output", default=None)
 
     # Model 4
-    sub.add_parser("train4",    help="Train Model 4 (Energy-Based Model) on data/raw/data.txt")
+    sub.add_parser("train4",    help="Train Model 4 (Energy-Based Model)")
     sub.add_parser("evaluate4", help="Evaluate Model 4 on the val split")
-    pred4_p = sub.add_parser("predict4", help="Run Model 4 inference on an input file")
-    pred4_p.add_argument("-i", "--input",  default=None, help="Path to input conditions file")
-    pred4_p.add_argument("-o", "--output", default=None, help="Path to write predictions")
+    pred4_p = sub.add_parser("predict4", help="Run Model 4 inference")
+    pred4_p.add_argument("-i", "--input",  default=None)
+    pred4_p.add_argument("-o", "--output", default=None)
 
     args = parser.parse_args()
 
