@@ -148,15 +148,8 @@ def cmd_train2(args):
         path2_cfg.data_path, train2_cfg.val_split, train2_cfg.seed)
     print(f"Train  : {len(train_ds)} samples  |  Val : {len(val_ds)} samples")
 
-    # Optional warm-start from Model 1 encoder
-    m1_path = (path2_cfg.model1_weights_path
-               if os.path.exists(path2_cfg.model1_weights_path) else None)
-    if m1_path:
-        print(f"Warm-starting encoder from Model 1 → {m1_path}")
-
     G, D, encoder, history = train_model2(
         train_ds, val_ds, model2_cfg, train2_cfg, device,
-        model1_weights_path=m1_path,
     )
 
     os.makedirs(os.path.dirname(path2_cfg.generator_path), exist_ok=True)

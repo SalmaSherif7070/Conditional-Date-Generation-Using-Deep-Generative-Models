@@ -55,5 +55,3 @@ class Path2Config:
     discriminator_path: str = "models/model_2/discriminator.pt"
     encoder_path: str = "models/model_2/encoder.pt"
     figures_dir: str = "output/figures/model_2"
-    # Optional: path to model 1 weights for encoder warm-start
-    model1_weights_path: str = "models/model_1/weights.pt"
