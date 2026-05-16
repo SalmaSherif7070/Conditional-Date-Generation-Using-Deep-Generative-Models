@@ -38,6 +38,24 @@ class Train2Config:
 
 
 @dataclass
+class Model3Config:
+    cond_dim: int = 128
+    max_decade: int = 300
+    z_dim: int = 64
+
+
+@dataclass
+class Train3Config:
+    n_epochs: int = 200
+    batch_size: int = 256
+    lr: float = 1e-3
+    beta_max: float = 0.5
+    beta_warmup_frac: float = 0.5   # fraction of epochs for β warm-up
+    val_split: float = 0.2
+    seed: int = 42
+
+
+@dataclass
 class PathConfig:
     data_path: str = "data/raw/data.txt"
     example_input_path: str = "data/raw/example_input.txt"
@@ -55,3 +73,12 @@ class Path2Config:
     discriminator_path: str = "models/model_2/discriminator.pt"
     encoder_path: str = "models/model_2/encoder.pt"
     figures_dir: str = "output/figures/model_2"
+
+
+@dataclass
+class Path3Config:
+    data_path: str = "data/raw/data.txt"
+    example_input_path: str = "data/raw/example_input.txt"
+    output_dir: str = "output/model_3"
+    weights_path: str = "models/model_3/weights.pt"
+    figures_dir: str = "output/model_3/figures"
