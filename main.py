@@ -9,6 +9,11 @@ Usage:
   python main.py train2
   python main.py evaluate2
   python main.py predict2 -i data/raw/example_input.txt -o output/predictions_model2.txt
+
+  # Model 3 (Conditional VAE)
+  python main.py train3
+  python main.py evaluate3
+  python main.py predict3 -i data/raw/example_input.txt -o output/model_3/predictions.txt
 """
 import argparse
 import os
@@ -17,6 +22,7 @@ import torch
 from src.config import (
     ModelConfig, TrainConfig, PathConfig,
     Model2Config, Train2Config, Path2Config,
+    Model3Config, Train3Config, Path3Config,
 )
 from src.data_processing import load_dataset, load_example_input, format_output_line
 
@@ -29,6 +35,20 @@ from src.visualization import plot_loss_curves, plot_condition_breakdown, plot_l
 # Model 2
 from src.model_2.model import DateGenerator, ConditionEncoder
 from src.model_2.train import train as train_model2
+
+# Model 3
+from src.model_3.model import DateCVAE
+from src.model_3.train import train as train_model3
+from src.model_3.evaluate import evaluate_model as evaluate_model3
+from src.model_3.visualization import (
+    plot_loss_curves as plot_loss_curves3,
+    plot_loss_log_scale as plot_loss_log_scale3,
+    plot_condition_breakdown as plot_condition_breakdown3,
+    plot_recon_kl_split,
+    plot_beta_schedule,
+    plot_csr_curve as plot_csr_curve3,
+    plot_combined_overview as plot_combined_overview3,
+)
 
 
 def _device() -> str:
@@ -75,6 +95,19 @@ def _load_model2(path2_cfg: Path2Config, model2_cfg: Model2Config, device: str):
     generator.eval()
 
     return _Model2Wrapper(generator, encoder)
+
+
+# ── Model 3 helpers ────────────────────────────────────────────────────────────
+
+def _load_model3(path3_cfg: Path3Config, model3_cfg: Model3Config, device: str) -> DateCVAE:
+    model = DateCVAE(
+        z_dim=model3_cfg.z_dim,
+        cond_dim=model3_cfg.cond_dim,
+        max_decade=model3_cfg.max_decade,
+    ).to(device)
+    model.load_state_dict(torch.load(path3_cfg.weights_path, map_location=device))
+    model.eval()
+    return model
 
 
 # ── Model 1 subcommands ────────────────────────────────────────────────────────
@@ -161,18 +194,15 @@ def cmd_train2(args):
     print(f"Encoder       saved → {path2_cfg.encoder_path}")
 
     model2 = _Model2Wrapper(G, encoder)
-    metrics = evaluate_model1(model2, val_ds, device)
+    metrics = evaluate_model1(G, encoder, val_ds, device)
 
-    # Adapt history keys so shared visualization functions work
-    # plot_loss_curves expects: train_loss, val_loss
     vis_history = {
         "epochs":     history["epochs"],
-        "train_loss": history["g_loss"],   # generator loss as "train"
-        "val_loss":   history["d_loss"],   # discriminator loss as "val"
+        "train_loss": history["g_loss"],
+        "val_loss":   history["d_loss"],
     }
-    # Reuse shared visualization — saves into model_2 figures dir
-    plot_loss_curves(vis_history,         path2_cfg.figures_dir)
-    plot_loss_log_scale(vis_history,      path2_cfg.figures_dir)
+    plot_loss_curves(vis_history,     path2_cfg.figures_dir)
+    plot_loss_log_scale(vis_history,  path2_cfg.figures_dir)
     plot_condition_breakdown(metrics, path2_cfg.figures_dir)
 
 
@@ -185,7 +215,7 @@ def cmd_evaluate2(args):
     _, val_ds, _, _ = load_dataset(
         path2_cfg.data_path, train2_cfg.val_split, train2_cfg.seed)
     model2  = _load_model2(path2_cfg, model2_cfg, device)
-    metrics = evaluate_model1(model2, val_ds, device)
+    metrics = evaluate_model1(model2.generator, model2.encoder, val_ds, device)
     plot_condition_breakdown(metrics, path2_cfg.figures_dir)
 
 
@@ -212,10 +242,76 @@ def cmd_predict2(args):
     print(f"Predictions ({len(X)}) → {output_path}")
 
 
+# ── Model 3 subcommands ────────────────────────────────────────────────────────
+
+def cmd_train3(args):
+    model3_cfg = Model3Config()
+    train3_cfg = Train3Config()
+    path3_cfg  = Path3Config()
+    device     = _device()
+
+    print(f"Device : {device.upper()}")
+    train_ds, val_ds, _, _ = load_dataset(
+        path3_cfg.data_path, train3_cfg.val_split, train3_cfg.seed)
+    print(f"Train  : {len(train_ds)} samples  |  Val : {len(val_ds)} samples")
+
+    model, history = train_model3(train_ds, val_ds, model3_cfg, train3_cfg, device)
+
+    os.makedirs(os.path.dirname(path3_cfg.weights_path), exist_ok=True)
+    torch.save(model.state_dict(), path3_cfg.weights_path)
+    print(f"\nWeights saved → {path3_cfg.weights_path}")
+
+    metrics = evaluate_model3(model, val_ds, device)
+
+    plot_loss_curves3(history,         path3_cfg.figures_dir)
+    plot_loss_log_scale3(history,      path3_cfg.figures_dir)
+    plot_recon_kl_split(history,       path3_cfg.figures_dir)
+    plot_beta_schedule(history,        path3_cfg.figures_dir)
+    plot_csr_curve3(history,           path3_cfg.figures_dir)
+    plot_condition_breakdown3(metrics, path3_cfg.figures_dir)
+    plot_combined_overview3(history, metrics, path3_cfg.figures_dir)
+
+
+def cmd_evaluate3(args):
+    model3_cfg = Model3Config()
+    path3_cfg  = Path3Config()
+    train3_cfg = Train3Config()
+    device     = _device()
+
+    _, val_ds, _, _ = load_dataset(
+        path3_cfg.data_path, train3_cfg.val_split, train3_cfg.seed)
+    model   = _load_model3(path3_cfg, model3_cfg, device)
+    metrics = evaluate_model3(model, val_ds, device)
+    plot_condition_breakdown3(metrics, path3_cfg.figures_dir)
+
+
+def cmd_predict3(args):
+    model3_cfg  = Model3Config()
+    path3_cfg   = Path3Config()
+    device      = _device()
+    input_path  = args.input  or path3_cfg.example_input_path
+    output_path = args.output or os.path.join(path3_cfg.output_dir, "predictions.txt")
+
+    model = _load_model3(path3_cfg, model3_cfg, device)
+
+    X, _ = load_example_input(input_path)
+    X    = X.to(device)
+    with torch.no_grad():
+        Y_gen = model.sample(X, n_samples=1, device=device).cpu()
+
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(out_dir, exist_ok=True)
+    with open(output_path, "w") as f:
+        for i, cond in enumerate(X.cpu().tolist()):
+            f.write(format_output_line(cond, Y_gen[i].tolist()) + "\n")
+
+    print(f"Predictions ({len(X)}) → {output_path}")
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Date Generator – Model 1 & Model 2")
+    parser = argparse.ArgumentParser(description="Date Generator – Models 1, 2 & 3")
     sub    = parser.add_subparsers(dest="command", required=True)
 
     # Model 1
@@ -232,6 +328,13 @@ if __name__ == "__main__":
     pred2_p.add_argument("-i", "--input",  default=None, help="Path to input conditions file")
     pred2_p.add_argument("-o", "--output", default=None, help="Path to write predictions")
 
+    # Model 3
+    sub.add_parser("train3",    help="Train Model 3 (Conditional VAE) on data/raw/data.txt")
+    sub.add_parser("evaluate3", help="Evaluate Model 3 on the val split")
+    pred3_p = sub.add_parser("predict3", help="Run Model 3 inference on an input file")
+    pred3_p.add_argument("-i", "--input",  default=None, help="Path to input conditions file")
+    pred3_p.add_argument("-o", "--output", default=None, help="Path to write predictions")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -241,5 +344,8 @@ if __name__ == "__main__":
         "train2":    cmd_train2,
         "evaluate2": cmd_evaluate2,
         "predict2":  cmd_predict2,
+        "train3":    cmd_train3,
+        "evaluate3": cmd_evaluate3,
+        "predict3":  cmd_predict3,
     }
     dispatch[args.command](args)
