@@ -9,7 +9,7 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    n_epochs: int = 300
+    n_epochs: int = 100
     batch_size: int = 256
     lr: float = 2e-3
     val_split: float = 0.2
