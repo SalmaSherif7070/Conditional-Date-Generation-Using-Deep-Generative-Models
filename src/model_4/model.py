@@ -1,40 +1,35 @@
 """
-Energy-Based Model (EBM) Date Generator – Model 4
-===================================================
+Conditional Diffusion Model (DDPM / DDIM) Date Generator – Model 4
+===================================================================
 Architecture
 ------------
-  ConditionEncoder : (dow, month_idx, leap, decade) → 128-dim condition.
-                     Identical interface to Models 1–3 for interoperability.
+  ConditionEncoder   : (dow, month_idx, leap, decade) → cond_dim embedding.
+                       Identical to Models 1–3.
 
-  DateEnergyNet    : Scalar energy function  E(date, condition) → ℝ.
-                     Lower energy  ↔  more plausible (date, condition) pair.
-                     Date is embedded the same way as the CVAE discriminator
-                     (day, month, decade, year-unit each get a learnable
-                     embedding), then concatenated with the condition vector
-                     and passed through a deep residual MLP.
+  SinusoidalTimeEmb  : timestep t → time_dim via sinusoidal encoding + MLP.
 
-  DateEBM          : Wraps ConditionEncoder + DateEnergyNet and exposes the
-                     project-standard  .sample(X, n_samples, device)  method
-                     using Langevin MCMC with calendar constraints applied
-                     after each step.
+  DateEmbedder       : (day, month, year) → continuous embedding for diffusion.
+                       Day, month, decade, year-unit each get a learned embedding.
 
-Training objective : Contrastive Divergence (CD)
-    L = E(x⁺, c) − E(x⁻, c)  +  λ·[E(x⁺,c)² + E(x⁻,c)²]
-  x⁺  real date from the dataset
-  x⁻  negative sample drawn by running Langevin dynamics from a persistent
-      replay buffer (following Du & Mordatch, 2019).
+  DenoisingNet       : (x_t, cond_emb, time_emb) → x0_pred + discrete logits.
+                       Residual MLP with FiLM conditioning (scale+shift).
+                       Auxiliary discrete heads provide strong gradient signal.
 
-Sampling (inference)
---------------------
-  Discrete Langevin with constraint projection:
-    1. Initialise from a replay-buffer entry or random valid date.
-    2. Repeat for n_mcmc_steps:
-         a. Embed the current discrete date as continuous one-hot weights.
-         b. Compute ∂E/∂embed  via autograd.
-         c. Update each component logit with a gradient step + Gaussian noise.
-         d. Project back to a valid integer date (greedy argmax + calendar
-            constraints for decade, leap-year, day-of-week).
-    3. Return the final constrained sample.
+  DateDiffusionModel : Full model. Forward process adds Gaussian noise (linear
+                       beta schedule, T steps). Trained with "predict-x0" MSE +
+                       auxiliary cross-entropy on discrete heads.
+                       Inference via DDIM (50 steps default) — ~10× faster than
+                       DDPM. Final discrete projection enforces all calendar
+                       constraints identically to Models 1–3.
+
+Training objective
+------------------
+  L = MSE(x0_pred, x0_embed) + aux_weight * CE(discrete_heads, Y)
+
+Sampling (DDIM)
+---------------
+  x_T ~ N(0, I)  →  DDIM reverse for ddim_steps  →  project logits to
+  valid (day, month, year) via constraint masks (dow, leap, month, decade).
 """
 import math
 import torch
@@ -42,7 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ── Calendar helpers (vectorised, matches Models 1–3) ─────────────────────────
+# ── Calendar helpers (identical to Models 1–3) ────────────────────────────────
 
 def is_leap(y: torch.Tensor) -> torch.Tensor:
     return ((y % 4 == 0) & (y % 100 != 0)) | (y % 400 == 0)
@@ -63,67 +58,68 @@ def day_of_week(d: torch.Tensor, m: torch.Tensor, y: torch.Tensor) -> torch.Tens
     ms = torch.clamp(m, 1, 12)
     ya = y - (ms < 3).long()
     dow_sun = (ya + ya // 4 - ya // 100 + ya // 400 + t[ms - 1] + d) % 7
-    return (dow_sun + 6) % 7  # shift so 0=Mon
+    return (dow_sun + 6) % 7
 
 
 # ── Condition Encoder ──────────────────────────────────────────────────────────
 
 class ConditionEncoder(nn.Module):
-    """
-    Encodes (dow, month_idx, leap, decade) → cond_dim-dimensional vector.
-    Identical interface to Models 1–3.
-    """
-
     def __init__(self, cond_dim: int = 128, max_decade: int = 300):
         super().__init__()
-        self.cond_dim   = cond_dim
-        self.max_decade = max_decade
-
         self.emb_dow  = nn.Embedding(7,           16)
         self.emb_mon  = nn.Embedding(12,          16)
         self.emb_leap = nn.Embedding(2,            8)
         self.emb_dec  = nn.Embedding(max_decade,  32)
-
-        # 16+16+8+32+4(cyclical) = 76 → cond_dim
         self.cond_mlp = nn.Sequential(
-            nn.Linear(76, cond_dim),
-            nn.ReLU(),
-            nn.LayerNorm(cond_dim),
+            nn.Linear(76, cond_dim), nn.ReLU(), nn.LayerNorm(cond_dim),
         )
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        """X: (B, 4) — [dow, mon_idx, leap, decade]"""
         dow_rad = X[:, 0].float() * (2 * math.pi / 7.0)
         mon_rad = X[:, 1].float() * (2 * math.pi / 12.0)
         cyc = torch.stack([
-            torch.sin(dow_rad), torch.cos(dow_rad),
-            torch.sin(mon_rad), torch.cos(mon_rad),
+            dow_rad.sin(), dow_rad.cos(), mon_rad.sin(), mon_rad.cos(),
         ], dim=-1)
         h = torch.cat([
-            self.emb_dow(X[:, 0]),
-            self.emb_mon(X[:, 1]),
-            self.emb_leap(X[:, 2]),
-            self.emb_dec(X[:, 3]),
-            cyc,
+            self.emb_dow(X[:, 0]), self.emb_mon(X[:, 1]),
+            self.emb_leap(X[:, 2]), self.emb_dec(X[:, 3]), cyc,
         ], dim=-1)
         return self.cond_mlp(h)
 
 
-# ── Date Embedding (shared by energy net) ────────────────────────────────────
+# ── Sinusoidal Time Embedding ─────────────────────────────────────────────────
+
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, dim: int = 128):
+        super().__init__()
+        self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4), nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (B,) integer timesteps → (B, dim)."""
+        half = self.dim // 2
+        freqs = torch.exp(
+            -math.log(10000) * torch.arange(half, device=t.device, dtype=torch.float) / (half - 1)
+        )
+        args = t.float().unsqueeze(1) * freqs.unsqueeze(0)
+        emb  = torch.cat([args.sin(), args.cos()], dim=-1)
+        return self.mlp(emb)
+
+
+# ── Date Embedder ─────────────────────────────────────────────────────────────
 
 class DateEmbedder(nn.Module):
-    """
-    Embeds an integer date (day, month, year) into a fixed-size vector.
-    Mirrors the discriminator embeddings used in Models 2 & 3 for consistency.
-    """
+    """Maps integer date (day, month, year) → continuous embedding for diffusion."""
 
     def __init__(self, max_decade: int = 300, emb_dim: int = 32):
         super().__init__()
         self.emb_dim    = emb_dim
         self.max_decade = max_decade
-
-        self.emb_day  = nn.Embedding(32,          emb_dim)   # indices 1–31
-        self.emb_mon  = nn.Embedding(13,          emb_dim)   # indices 1–12
+        self.emb_day  = nn.Embedding(32,          emb_dim)
+        self.emb_mon  = nn.Embedding(13,          emb_dim)
         self.emb_dec  = nn.Embedding(max_decade,  emb_dim)
         self.emb_unit = nn.Embedding(10,          emb_dim)
 
@@ -132,361 +128,257 @@ class DateEmbedder(nn.Module):
         return self.emb_dim * 4
 
     def forward(self, Y: torch.Tensor) -> torch.Tensor:
-        """Y: (B, 3) integer [day, month, year]  →  (B, 4 * emb_dim)."""
+        """Y: (B, 3) integer [day, month, year] → (B, 4*emb_dim)."""
         d, m, y = Y[:, 0], Y[:, 1], Y[:, 2]
-        dec, unit = y // 10, y % 10
         return torch.cat([
             self.emb_day(d.clamp(1, 31)),
             self.emb_mon(m.clamp(1, 12)),
-            self.emb_dec(dec.clamp(0, self.max_decade - 1)),
-            self.emb_unit(unit),
+            self.emb_dec((y // 10).clamp(0, self.max_decade - 1)),
+            self.emb_unit(y % 10),
         ], dim=-1)
 
-    def embed_soft(
-        self,
-        w_day: torch.Tensor,   # (B, 31)  soft weights over days 1–31
-        w_mon: torch.Tensor,   # (B, 12)  soft weights over months 1–12
-        w_dec: torch.Tensor,   # (B, D)   soft weights over decades
-        w_unit: torch.Tensor,  # (B, 10)  soft weights over year-units
-    ) -> torch.Tensor:
-        """Differentiable embedding via weighted combination — used in Langevin."""
-        d_emb    = w_day  @ self.emb_day.weight[1:32]          # skip index 0
-        m_emb    = w_mon  @ self.emb_mon.weight[1:13]          # skip index 0
-        dec_emb  = w_dec  @ self.emb_dec.weight
-        unit_emb = w_unit @ self.emb_unit.weight
-        return torch.cat([d_emb, m_emb, dec_emb, unit_emb], dim=-1)
 
+# ── FiLM Residual Block ───────────────────────────────────────────────────────
 
-# ── Residual Block ────────────────────────────────────────────────────────────
+class _FiLMBlock(nn.Module):
+    """Residual block with FiLM (scale + shift) conditioning."""
 
-class _ResBlock(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, cond_dim: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim), nn.SiLU(),
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim),
-        )
-        self.act = nn.SiLU()
+        self.norm      = nn.LayerNorm(dim)
+        self.net       = nn.Sequential(nn.Linear(dim, dim * 2), nn.SiLU(), nn.Linear(dim * 2, dim))
+        self.cond_proj = nn.Linear(cond_dim, dim * 2)   # → (scale, shift)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.net(x))
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        scale, shift = self.cond_proj(cond).chunk(2, dim=-1)
+        h = self.norm(x) * (1 + scale) + shift
+        return x + self.net(h)
 
 
-# ── Energy Network ────────────────────────────────────────────────────────────
+# ── Denoising Network ─────────────────────────────────────────────────────────
 
-class DateEnergyNet(nn.Module):
+class DenoisingNet(nn.Module):
     """
-    Scalar energy function  E(date_emb, cond_emb) → ℝ.
-
-    Input  : concatenation of DateEmbedder output (128-d) + ConditionEncoder
-             output (cond_dim-d).
-    Output : scalar energy per sample — lower is more plausible.
-
-    Architecture: linear projection → N residual blocks → scalar head.
-    Spectral normalisation on the input/output projections keeps the energy
-    landscape Lipschitz-bounded and improves Langevin mixing.
+    Predicts the clean embedding x0 from noisy embedding x_t, condition, and timestep.
+    Also outputs discrete logits (month, decade, unit, day) as auxiliary heads —
+    these provide strong gradient signal and are used directly at inference.
     """
 
     def __init__(
         self,
-        date_emb_dim: int = 128,   # DateEmbedder.out_dim (4 * 32)
-        cond_dim: int = 128,
-        hidden_dim: int = 512,
-        n_layers: int = 4,
+        date_dim: int,
+        cond_dim: int,
+        time_dim: int,
+        hidden_dim: int,
+        n_layers: int,
+        max_decade: int,
     ):
         super().__init__()
-        in_dim = date_emb_dim + cond_dim
+        film_cond = cond_dim + time_dim
 
-        SN = nn.utils.spectral_norm
-        self.proj_in = SN(nn.Linear(in_dim, hidden_dim))
-        self.act_in  = nn.SiLU()
-
-        self.res_blocks = nn.ModuleList(
-            [_ResBlock(hidden_dim) for _ in range(n_layers)]
+        self.input_proj  = nn.Linear(date_dim, hidden_dim)
+        self.res_blocks  = nn.ModuleList(
+            [_FiLMBlock(hidden_dim, film_cond) for _ in range(n_layers)]
         )
+        self.output_proj = nn.Linear(hidden_dim, date_dim)   # x0 embedding pred
 
-        self.proj_out = SN(nn.Linear(hidden_dim, 1))
+        # Discrete logit heads
+        self.head_mon  = nn.Linear(hidden_dim, 12)
+        self.head_dec  = nn.Linear(hidden_dim, max_decade)
+        self.head_unit = nn.Linear(hidden_dim, 10)
+        self.head_day  = nn.Linear(hidden_dim, 31)
 
-    def forward(self, date_emb: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
-        """Returns (B, 1) energy scores."""
-        h = self.act_in(self.proj_in(torch.cat([date_emb, cond_emb], dim=-1)))
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        cond_emb: torch.Tensor,
+        time_emb: torch.Tensor,
+    ):
+        """Returns (x0_pred, logits_mon, logits_dec, logits_unit, logits_day)."""
+        film_cond = torch.cat([cond_emb, time_emb], dim=-1)
+        h = self.input_proj(x_t)
         for block in self.res_blocks:
-            h = block(h)
-        return self.proj_out(h)
+            h = block(h, film_cond)
+        x0_pred    = self.output_proj(h)
+        return x0_pred, self.head_mon(h), self.head_dec(h), self.head_unit(h), self.head_day(h)
 
 
-# ── Replay Buffer ─────────────────────────────────────────────────────────────
+# ── Full Diffusion Model ──────────────────────────────────────────────────────
 
-class ReplayBuffer:
+class DateDiffusionModel(nn.Module):
     """
-    Persistent replay buffer for EBM training (Du & Mordatch, 2019).
-    Stores past MCMC negative samples as integer tensors of shape (3,) = [d, m, y].
-    """
-
-    def __init__(self, capacity: int = 10_000):
-        self.capacity = capacity
-        self.buffer: list[torch.Tensor] = []
-        self._ptr = 0
-
-    def __len__(self) -> int:
-        return len(self.buffer)
-
-    def push(self, samples: torch.Tensor):
-        """samples: (B, 3) CPU tensor."""
-        for s in samples:
-            if len(self.buffer) < self.capacity:
-                self.buffer.append(s.clone())
-            else:
-                self.buffer[self._ptr] = s.clone()
-                self._ptr = (self._ptr + 1) % self.capacity
-
-    def sample(self, n: int) -> torch.Tensor:
-        """Returns (n, 3) tensor; raises if buffer is empty."""
-        idx = torch.randint(len(self.buffer), (n,))
-        return torch.stack([self.buffer[i] for i in idx])
-
-
-# ── Full EBM ──────────────────────────────────────────────────────────────────
-
-class DateEBM(nn.Module):
-    """
-    Full Energy-Based Model combining ConditionEncoder, DateEmbedder,
-    and DateEnergyNet.
-
-    Exposes the project-standard interface:
-        .energy(X, Y)              → (B, 1) scalar energies
-        .sample(X, n_samples, device) → (B * n_samples, 3) integer dates
-
-    Langevin sampling strategy
-    --------------------------
-    Because dates are discrete, we work in the *logit space* of each
-    component (month, decade, year-unit, day) and project back to integers
-    after each step:
-
-      logit ← logit − α · ∂E/∂embed(soft_date)  +  σ · ε,   ε ~ N(0, I)
-
-    Calendar constraints are enforced by masking invalid logits to −∞
-    before taking the argmax (exactly as in Models 1–3 during sampling).
-    This gives a valid calendar date at every Langevin step.
+    Conditional DDPM/DDIM for date generation.
+    Exposes the project-standard  .sample(X, n_samples, device)  interface.
     """
 
     def __init__(
         self,
-        cond_dim: int = 128,
-        max_decade: int = 300,
-        hidden_dim: int = 512,
-        n_layers: int = 4,
+        cond_dim: int    = 128,
+        max_decade: int  = 300,
+        hidden_dim: int  = 512,
+        n_layers: int    = 6,
+        time_dim: int    = 128,
+        T: int           = 500,
+        emb_dim: int     = 32,
     ):
         super().__init__()
+        self.T          = T
         self.max_decade = max_decade
 
         self.condition_encoder = ConditionEncoder(cond_dim, max_decade)
-        self.date_embedder     = DateEmbedder(max_decade, emb_dim=32)
-        self.energy_net        = DateEnergyNet(
-            date_emb_dim=self.date_embedder.out_dim,
+        self.date_embedder     = DateEmbedder(max_decade, emb_dim)
+        self.time_embedding    = SinusoidalTimeEmbedding(time_dim)
+        self.denoiser          = DenoisingNet(
+            date_dim=self.date_embedder.out_dim,
             cond_dim=cond_dim,
+            time_dim=time_dim,
             hidden_dim=hidden_dim,
             n_layers=n_layers,
+            max_decade=max_decade,
         )
 
-    # ── Energy helpers ────────────────────────────────────────────────────────
+        # Linear beta noise schedule
+        betas     = torch.linspace(1e-4, 0.02, T)
+        alpha_bar = torch.cumprod(1.0 - betas, dim=0)
+        self.register_buffer("betas",                   betas)
+        self.register_buffer("alpha_bar",               alpha_bar)
+        self.register_buffer("sqrt_alpha_bar",          alpha_bar.sqrt())
+        self.register_buffer("sqrt_one_minus_alpha_bar", (1 - alpha_bar).sqrt())
 
-    def energy(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-        """
-        E(condition, date).
-        X: (B, 4) condition  |  Y: (B, 3) integer date
-        Returns (B, 1).
-        """
-        cond_emb = self.condition_encoder(X)
-        date_emb = self.date_embedder(Y)
-        return self.energy_net(date_emb, cond_emb)
+    # ── Forward process ───────────────────────────────────────────────────────
 
-    def energy_soft(
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None):
+        """x_t = √ᾱ_t · x0 + √(1−ᾱ_t) · ε."""
+        if noise is None:
+            noise = torch.randn_like(x0)
+        s = self.sqrt_alpha_bar[t].unsqueeze(-1)
+        r = self.sqrt_one_minus_alpha_bar[t].unsqueeze(-1)
+        return s * x0 + r * noise
+
+    # ── Training step ─────────────────────────────────────────────────────────
+
+    def training_loss(
         self,
-        cond_emb: torch.Tensor,
-        w_day: torch.Tensor,
-        w_mon: torch.Tensor,
-        w_dec: torch.Tensor,
-        w_unit: torch.Tensor,
-    ) -> torch.Tensor:
-        """Differentiable energy for Langevin gradient computation."""
-        date_emb = self.date_embedder.embed_soft(w_day, w_mon, w_dec, w_unit)
-        return self.energy_net(date_emb, cond_emb)
+        X: torch.Tensor,
+        Y: torch.Tensor,
+        aux_weight: float = 0.1,
+    ):
+        """
+        Predict-x0 diffusion loss + auxiliary discrete CE.
+        Returns (total_loss, mse_loss.item(), ce_loss.item()).
+        """
+        B      = X.shape[0]
+        device = X.device
+
+        cond_emb = self.condition_encoder(X)
+        x0       = self.date_embedder(Y)
+
+        t     = torch.randint(0, self.T, (B,), device=device)
+        x_t   = self.q_sample(x0, t)
+        t_emb = self.time_embedding(t)
+
+        x0_pred, l_mon, l_dec, l_unit, l_day = self.denoiser(x_t, cond_emb, t_emb)
+
+        mse = F.mse_loss(x0_pred, x0)
+
+        d_t, m_t, y_t = Y[:, 0], Y[:, 1], Y[:, 2]
+        ce = (
+            F.cross_entropy(l_mon,  m_t - 1)    +
+            F.cross_entropy(l_dec,  y_t // 10)  +
+            F.cross_entropy(l_unit, y_t % 10)   +
+            F.cross_entropy(l_day,  d_t - 1)
+        )
+
+        total = mse + aux_weight * ce
+        return total, mse.item(), ce.item()
 
     # ── Constrained projection ────────────────────────────────────────────────
 
-    @staticmethod
     def _project_to_valid_date(
-        logit_mon: torch.Tensor,   # (B, 12)
-        logit_dec: torch.Tensor,   # (B, max_decade)  — masked to condition
-        logit_unit: torch.Tensor,  # (B, 10)
-        logit_day: torch.Tensor,   # (B, 31)
-        X_cond: torch.Tensor,      # (B, 4)
+        self,
+        l_mon: torch.Tensor,
+        l_dec: torch.Tensor,
+        l_unit: torch.Tensor,
+        l_day: torch.Tensor,
+        X_cond: torch.Tensor,
         device: str,
-    ):
-        """
-        Project continuous logits to a valid (d, m, y) integer date tuple
-        while enforcing all four calendar constraints.
-        Returns (day, month, year) each (B,).
-        """
-        B         = logit_mon.shape[0]
+    ) -> torch.Tensor:
+        """Project denoised logits to a valid calendar date (same masks as Models 1–3)."""
+        B         = l_mon.shape[0]
         dow_cond  = X_cond[:, 0]
         leap_cond = X_cond[:, 2]
         dec_cond  = X_cond[:, 3]
 
-        # 1. Month — greedy, constrained to the condition month
-        mon_mask = torch.full((B, 12), float("-inf"), device=device)
-        mon_mask.scatter_(1, X_cond[:, 1:2].long(), 0.0)
-        mon_pred = torch.argmax(logit_mon + mon_mask, dim=-1) + 1  # 1-indexed
+        # Month: fixed by condition
+        mon_pred = X_cond[:, 1].long() + 1   # 0-indexed → 1-indexed
 
-        # 2. Decade — fixed by condition (same as Models 1–3)
+        # Decade: fixed by condition
         dec_pred = dec_cond.long()
 
-        # 3. Year unit — constrained by leap-year condition
+        # Year unit: constrained by leap-year condition
         y_cands     = dec_pred.unsqueeze(1) * 10 + torch.arange(10, device=device)
         valid_units = is_leap(y_cands).long() == leap_cond.unsqueeze(1)
-        masked_unit = logit_unit.masked_fill(~valid_units, float("-inf"))
-        unit_pred   = torch.multinomial(F.softmax(masked_unit, dim=-1), 1).squeeze(-1)
+        l_unit_m    = l_unit.masked_fill(~valid_units, float("-inf"))
+        probs_unit  = F.softmax(l_unit_m, dim=-1)
+        probs_unit  = torch.nan_to_num(probs_unit, nan=0.0)
+        probs_unit[probs_unit.sum(-1) == 0, 0] = 1.0
+        unit_pred   = torch.multinomial(probs_unit, 1).squeeze(-1)
         y_pred      = dec_pred * 10 + unit_pred
 
-        # 4. Day — constrained by valid range + day-of-week
+        # Day: constrained by valid range + day-of-week
         d_cands      = torch.arange(1, 32, device=device).unsqueeze(0).expand(B, 31)
         valid_bounds = d_cands <= days_in_month(mon_pred, y_pred).unsqueeze(1)
         dow_cands    = day_of_week(d_cands, mon_pred.unsqueeze(1), y_pred.unsqueeze(1))
         valid_dow    = dow_cands == dow_cond.unsqueeze(1)
-        masked_day   = logit_day.masked_fill(~(valid_bounds & valid_dow), float("-inf"))
-        probs_day    = F.softmax(masked_day, dim=-1)
+        l_day_m      = l_day.masked_fill(~(valid_bounds & valid_dow), float("-inf"))
+        probs_day    = F.softmax(l_day_m, dim=-1)
         probs_day    = torch.nan_to_num(probs_day, nan=0.0)
-        probs_day[probs_day.sum(dim=-1) == 0, 0] = 1.0  # fallback
+        probs_day[probs_day.sum(-1) == 0, 0] = 1.0
         day_pred     = torch.multinomial(probs_day, 1).squeeze(-1) + 1
-
-        return day_pred, mon_pred, y_pred
-
-    # ── Langevin MCMC ─────────────────────────────────────────────────────────
-
-    def langevin_sample(
-        self,
-        X_cond: torch.Tensor,        # (B, 4) condition
-        init_Y: torch.Tensor | None, # (B, 3) integer starting point (optional)
-        n_steps: int = 60,
-        step_size: float = 0.1,
-        noise_std: float = 0.005,
-        device: str = "cpu",
-    ) -> torch.Tensor:
-        """
-        Discrete Langevin dynamics in logit space with calendar-constrained
-        projection at every step.
-
-        Returns (B, 3) integer tensor of sampled dates [day, month, year].
-        """
-        B         = X_cond.shape[0]
-        cond_emb  = self.condition_encoder(X_cond)  # fixed throughout
-
-        # Initialise logits from the starting integer date (or uniform)
-        if init_Y is not None:
-            # Warm-start: one-hot logits centred on the init date
-            d0, m0, y0 = init_Y[:, 0], init_Y[:, 1], init_Y[:, 2]
-            dec0, unit0 = y0 // 10, y0 % 10
-
-            logit_mon  = torch.zeros(B, 12,              device=device)
-            logit_dec  = torch.zeros(B, self.max_decade, device=device)
-            logit_unit = torch.zeros(B, 10,              device=device)
-            logit_day  = torch.zeros(B, 31,              device=device)
-
-            logit_mon.scatter_(1,  (m0 - 1).unsqueeze(1).long(), 3.0)
-            logit_dec.scatter_(1,  dec0.unsqueeze(1).long(),      3.0)
-            logit_unit.scatter_(1, unit0.unsqueeze(1).long(),     3.0)
-            logit_day.scatter_(1,  (d0 - 1).unsqueeze(1).long(),  3.0)
-        else:
-            logit_mon  = torch.randn(B, 12,              device=device)
-            logit_dec  = torch.randn(B, self.max_decade, device=device)
-            logit_unit = torch.randn(B, 10,              device=device)
-            logit_day  = torch.randn(B, 31,              device=device)
-
-        for _ in range(n_steps):
-            # Soft weights via softmax (differentiable)
-            w_mon  = F.softmax(logit_mon,  dim=-1).requires_grad_(True)
-            w_dec  = F.softmax(logit_dec,  dim=-1).requires_grad_(True)
-            w_unit = F.softmax(logit_unit, dim=-1).requires_grad_(True)
-            w_day  = F.softmax(logit_day,  dim=-1).requires_grad_(True)
-
-            E = self.energy_soft(cond_emb, w_day, w_mon, w_dec, w_unit).sum()
-            E.backward()
-
-            with torch.no_grad():
-                logit_mon  = (logit_mon  - step_size * w_mon.grad
-                              + noise_std * torch.randn_like(logit_mon)).detach()
-                logit_dec  = (logit_dec  - step_size * w_dec.grad
-                              + noise_std * torch.randn_like(logit_dec)).detach()
-                logit_unit = (logit_unit - step_size * w_unit.grad
-                              + noise_std * torch.randn_like(logit_unit)).detach()
-                logit_day  = (logit_day  - step_size * w_day.grad
-                              + noise_std * torch.randn_like(logit_day)).detach()
-
-        # Final constrained projection
-        with torch.no_grad():
-            day_pred, mon_pred, y_pred = self._project_to_valid_date(
-                logit_mon, logit_dec, logit_unit, logit_day, X_cond, device,
-            )
 
         return torch.stack([day_pred, mon_pred, y_pred], dim=-1)
 
-    # ── Project-standard sample() ─────────────────────────────────────────────
+    # ── DDIM reverse sampling ─────────────────────────────────────────────────
 
     @torch.no_grad()
     def sample(
         self,
         X: torch.Tensor,
         n_samples: int = 1,
-        device: str = "cpu",
-        n_mcmc_steps: int = 60,
-        step_size: float = 0.1,
-        noise_std: float = 0.005,
+        device: str    = "cpu",
+        ddim_steps: int = 50,
     ) -> torch.Tensor:
         """
-        Constrained inference — matches Models 1–3 sample() signature.
-        Returns (B * n_samples, 3) tensor of [day, month, year].
-
-        Note: Langevin is run with gradient tracking turned on internally
-        even though this method is decorated with @no_grad, because the
-        Langevin loop needs gradients w.r.t. the soft logits (not model
-        parameters). The outer @no_grad prevents accidental parameter
-        gradient accumulation.
+        DDIM reverse process. Returns (B * n_samples, 3) integer dates [day, month, year].
+        Matches Models 1–3 sample() signature.
         """
-        X_rep = X.repeat_interleave(n_samples, dim=0)
+        X_rep    = X.repeat_interleave(n_samples, dim=0)
+        B        = X_rep.shape[0]
+        cond_emb = self.condition_encoder(X_rep)
+        date_dim = self.date_embedder.out_dim
 
-        # Temporarily enable grad for Langevin (model params won't accumulate)
-        with torch.enable_grad():
-            result = self.langevin_sample(
-                X_rep,
-                init_Y=None,
-                n_steps=n_mcmc_steps,
-                step_size=step_size,
-                noise_std=noise_std,
-                device=device,
-            )
-        return result
+        x = torch.randn(B, date_dim, device=device)
 
-    # ── CD Loss ───────────────────────────────────────────────────────────────
+        # Build DDIM timestep sequence (high → low, inclusive of 0)
+        step = max(1, self.T // ddim_steps)
+        ts   = list(range(self.T - 1, 0, -step))
+        if ts[-1] != 0:
+            ts.append(0)
 
-    def cd_loss(
-        self,
-        X: torch.Tensor,       # (B, 4)  condition
-        Y_pos: torch.Tensor,   # (B, 3)  real date (positive sample)
-        Y_neg: torch.Tensor,   # (B, 3)  MCMC negative sample
-        l2_reg: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Contrastive Divergence loss.
-            L = E(x⁺, c) − E(x⁻, c)  +  λ·[E(x⁺,c)² + E(x⁻,c)²]
+        l_mon = l_dec = l_unit = l_day = None
 
-        The regulariser prevents the energy landscape from collapsing.
-        Returns (loss, e_pos.mean(), e_neg.mean()) for logging.
-        """
-        e_pos = self.energy(X, Y_pos)   # (B, 1)
-        e_neg = self.energy(X, Y_neg)   # (B, 1)
+        for i, t_curr in enumerate(ts):
+            t_batch  = torch.full((B,), t_curr, device=device, dtype=torch.long)
+            t_emb    = self.time_embedding(t_batch)
+            x0_pred, l_mon, l_dec, l_unit, l_day = self.denoiser(x, cond_emb, t_emb)
 
-        cd    = (e_pos - e_neg).mean()
-        reg   = l2_reg * (e_pos.pow(2) + e_neg.pow(2)).mean()
-        return cd + reg, e_pos.detach().mean(), e_neg.detach().mean()
+            if i < len(ts) - 1:
+                t_prev   = ts[i + 1]
+                ab_curr  = self.alpha_bar[t_curr]
+                ab_prev  = self.alpha_bar[t_prev]
+
+                eps_pred = (x - ab_curr.sqrt() * x0_pred) / (1 - ab_curr).sqrt().clamp(min=1e-8)
+                x        = ab_prev.sqrt() * x0_pred + (1 - ab_prev).sqrt() * eps_pred
+            # else: last step — logits are already from the cleanest denoised state
+
+        return self._project_to_valid_date(l_mon, l_dec, l_unit, l_day, X_rep, device)
