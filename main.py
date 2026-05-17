@@ -15,7 +15,7 @@ Usage:
   python main.py evaluate3
   python main.py predict3 -i data/raw/example_input.txt -o output/model_3/predictions.txt
 
-  # Model 4 (Energy-Based Model)
+  # Model 4 (Conditional Diffusion)
   python main.py train4
   python main.py evaluate4
   python main.py predict4 -i data/raw/example_input.txt -o output/model_4/predictions.txt
@@ -58,14 +58,16 @@ from src.model_3.visualization import (
     plot_condition_breakdown as plot_condition_breakdown3,
 )
 
-# Model 4
-from src.model_4.model import DateEBM
+# Model 4  ← DateDiffusionModel (was wrongly DateEBM)
+from src.model_4.model import DateDiffusionModel
 from src.model_4.train import train as train_model4
 from src.model_4.evaluate import evaluate_model as evaluate_model4
 from src.model_4.visualization import (
     plot_loss_curves as plot_loss_curves4,
     plot_loss_log_scale as plot_loss_log_scale4,
     plot_condition_breakdown as plot_condition_breakdown4,
+    plot_mse_ce_curves as plot_mse_ce_curves4,
+    plot_csr_curve as plot_csr_curve4,
 )
 
 
@@ -75,7 +77,7 @@ def _device() -> str:
 
 # ── Model 1 helpers ────────────────────────────────────────────────────────────
 
-def _load_model1(path_cfg: PathConfig, model_cfg: ModelConfig, device: str) -> AutoregressiveDateModel:
+def _load_model1(path_cfg, model_cfg, device):
     model = AutoregressiveDateModel(model_cfg.cond_dim, model_cfg.max_decade).to(device)
     model.load_state_dict(torch.load(path_cfg.weights_path, map_location=device))
     model.eval()
@@ -84,7 +86,7 @@ def _load_model1(path_cfg: PathConfig, model_cfg: ModelConfig, device: str) -> A
 
 # ── Model 2 helpers ────────────────────────────────────────────────────────────
 
-def _load_model2(path2_cfg: Path2Config, model2_cfg: Model2Config, device: str):
+def _load_model2(path2_cfg, model2_cfg, device):
     encoder = ConditionEncoder(model2_cfg.cond_dim, model2_cfg.max_decade).to(device)
     encoder.load_state_dict(torch.load(path2_cfg.encoder_path, map_location=device))
     encoder.eval()
@@ -98,7 +100,7 @@ def _load_model2(path2_cfg: Path2Config, model2_cfg: Model2Config, device: str):
 
 # ── Model 3 helpers ────────────────────────────────────────────────────────────
 
-def _load_model3(path3_cfg: Path3Config, model3_cfg: Model3Config, device: str) -> DateCVAE:
+def _load_model3(path3_cfg, model3_cfg, device):
     model = DateCVAE(
         z_dim=model3_cfg.z_dim,
         cond_dim=model3_cfg.cond_dim,
@@ -111,12 +113,15 @@ def _load_model3(path3_cfg: Path3Config, model3_cfg: Model3Config, device: str) 
 
 # ── Model 4 helpers ────────────────────────────────────────────────────────────
 
-def _load_model4(path4_cfg: Path4Config, model4_cfg: Model4Config, device: str) -> DateEBM:
-    model = DateEBM(
+def _load_model4(path4_cfg, model4_cfg, device):
+    model = DateDiffusionModel(
         cond_dim=model4_cfg.cond_dim,
         max_decade=model4_cfg.max_decade,
         hidden_dim=model4_cfg.hidden_dim,
         n_layers=model4_cfg.n_layers,
+        time_dim=model4_cfg.time_dim,
+        T=model4_cfg.T,
+        emb_dim=model4_cfg.emb_dim,
     ).to(device)
     model.load_state_dict(torch.load(path4_cfg.weights_path, map_location=device))
     model.eval()
@@ -208,8 +213,8 @@ def cmd_train2(args):
 
     metrics = evaluate_model2(G, encoder, val_ds, device)
 
-    plot_loss_curves2(history,      path2_cfg.figures_dir)
-    plot_loss_log_scale2(history,   path2_cfg.figures_dir)
+    plot_loss_curves2(history,         path2_cfg.figures_dir)
+    plot_loss_log_scale2(history,      path2_cfg.figures_dir)
     plot_condition_breakdown2(metrics, path2_cfg.figures_dir)
 
 
@@ -335,6 +340,8 @@ def cmd_train4(args):
 
     plot_loss_curves4(history,         path4_cfg.figures_dir)
     plot_loss_log_scale4(history,      path4_cfg.figures_dir)
+    plot_mse_ce_curves4(history,       path4_cfg.figures_dir)
+    plot_csr_curve4(history,           path4_cfg.figures_dir)
     plot_condition_breakdown4(metrics, path4_cfg.figures_dir)
 
 
@@ -364,13 +371,12 @@ def cmd_predict4(args):
     X, _ = load_example_input(input_path)
     X    = X.to(device)
     with torch.no_grad():
+        # Diffusion sample — only needs ddim_steps, no MCMC args
         Y_gen = model.sample(
             X,
             n_samples=1,
             device=device,
-            n_mcmc_steps=train4_cfg.n_mcmc_steps,
-            step_size=train4_cfg.mcmc_step_size,
-            noise_std=train4_cfg.mcmc_noise,
+            ddim_steps=train4_cfg.ddim_steps,
         ).cpu()
 
     out_dir = os.path.dirname(os.path.abspath(output_path))
@@ -410,7 +416,7 @@ if __name__ == "__main__":
     pred3_p.add_argument("-o", "--output", default=None)
 
     # Model 4
-    sub.add_parser("train4",    help="Train Model 4 (Energy-Based Model)")
+    sub.add_parser("train4",    help="Train Model 4 (Conditional Diffusion)")
     sub.add_parser("evaluate4", help="Evaluate Model 4 on the val split")
     pred4_p = sub.add_parser("predict4", help="Run Model 4 inference")
     pred4_p.add_argument("-i", "--input",  default=None)
